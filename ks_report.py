@@ -11,7 +11,6 @@
 """
 
 import argparse
-import csv
 import json
 import re
 import sys
@@ -21,225 +20,19 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-# namespace платформы: их чинит команда кластера, остальное — команды сервисов
-PLATFORM_NS = {
-    "kube-system", "kube-public", "kube-node-lease", "default", "argocd", "cert-manager",
-    "ceph-csi-cephfs", "ceph-csi-rbd", "cilium-secrets", "consul", "devops", "external-secrets",
-    "gitlab-runner", "gradle-cache", "ingress-nginx", "jaeger", "kubernetes-dashboard", "logging",
-    "monitoring", "nfs", "prometheus", "rabbitmq-operator", "vault",
-}
-SUBJECT_KINDS = {"User", "Group", "ServiceAccount"}
-RBAC_KINDS = SUBJECT_KINDS | {"Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding"}
-SEVERITY_RU = {"Critical": "критическая", "High": "высокая", "Medium": "средняя", "Low": "низкая"}
-SEVERITY_ORDER = {"критическая": 0, "высокая": 1, "средняя": 2, "низкая": 3}
-STATUS_RU = {"failed": "не пройдена", "passed": "пройдена", "skipped": "не проверялась"}
-STATUS_ORDER = {"не пройдена": 0, "не проверялась": 1, "пройдена": 2}
-PRIORITY_ORDER = {"P1": 0, "P2": 1, "P3": 2, "инфо": 3, "—": 4}
-PRIORITY_FILL = {"P1": "F4B6B6", "P2": "F9D9AE", "P3": "FFF1B8", "инфо": "E2E2E2"}
-PSEUDO = re.compile(r"\b(?:user|email)-\d{2,}\b")
-ENV_MASKED = "переменные-секреты, значение скрыто сканером"  # вид места из ks_sanitize.py
-FIX_NOISE = re.compile(r"seLinuxOptions|fsGroupChangePolicy")
-CHECKS = "'Проверки'"
+from ks_notes import (CONTROL_NOTES, ENV_MASKED, FIX_NOISE, FIX_OVERRIDE, PLATFORM_NS,
+                      PRIORITY_ORDER, PSEUDO, RBAC_KINDS, SECRET_ACTION, SEVERITY_ORDER,
+                      SEVERITY_RU, SKIPPED_NOTE, STATUS_ORDER, STATUS_RU, SUBJECT_KINDS,
+                      cis_parts, load_names, load_secret_places, zone_of)
 
+PRIORITY_FILL = {"P1": "F4B6B6", "P2": "F9D9AE", "P3": "FFF1B8", "инфо": "E2E2E2"}
+CHECKS = "'Проверки'"
 FONT = Font(name="Arial", size=10)
 BOLD = Font(name="Arial", size=10, bold=True)
 TITLE = Font(name="Arial", size=14, bold=True)
 HEADER_FONT = Font(name="Arial", size=10, bold=True, color="FFFFFF")
 HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
 SECTION_FILL = PatternFill("solid", fgColor="DDEBF7")
-
-PSA_WHAT = "В namespace не включён Pod Security Admission, поэтому ничто не мешает запустить такой под."
-PSA_FIX = ("Метка pod-security.kubernetes.io/enforce={level} на namespace. Сначала warn и audit, "
-           "чтобы найти нарушителей: kubectl label --dry-run=server --overwrite ns --all "
-           "pod-security.kubernetes.io/enforce={level}")
-
-
-def psa(level):
-    return ("P1", "платформа", PSA_WHAT, PSA_FIX.format(level=level))
-
-
-# приоритет, кто исправляет, что не так, что сделать — для непройденных проверок
-CONTROL_NOTES = {
-    "C-0211": ("P2", "команды сервисов",
-               "У подов и контейнеров не задан securityContext: запуск не от root, запрет повышения "
-               "привилегий, файловая система только для чтения, сброс capabilities.",
-               "Задать в общих шаблонах Helm-чартов: runAsNonRoot: true, allowPrivilegeEscalation: false, "
-               "readOnlyRootFilesystem: true (где приложение позволяет), capabilities.drop: [ALL]. "
-               "seLinuxOptions — только если на узлах включён SELinux."),
-    "C-0193": psa("baseline"),
-    "C-0197": psa("restricted"),
-    "C-0198": psa("restricted"),
-    "C-0199": psa("restricted"),
-    "C-0200": psa("baseline"),
-    "C-0201": psa("restricted"),
-    "C-0203": psa("baseline"),
-    "C-0204": psa("baseline"),
-    "C-0202": ("инфо", "платформа",
-               "Windows-контейнеры с доступом к узлу. Если узлов Windows нет, риска нет.",
-               "Закроется той же меткой Pod Security Admission (baseline)."),
-    "C-0041": ("P3", "платформа",
-               "Поды с hostNetwork — общая сеть с узлом. Обычно это системные компоненты "
-               "(сетевой плагин, ingress, мониторинг), которым это нужно по устройству.",
-               "Проверить по листу «Находки», что в списке только системные компоненты; "
-               "прикладным подам hostNetwork не выдавать. Запрет для прикладных namespace даёт "
-               "та же метка Pod Security Admission (baseline)."),
-    "C-0275": ("P3", "платформа",
-               "Поды с hostPID видят процессы узла.",
-               "То же, что и с hostNetwork: убедиться, что это только системные компоненты; "
-               "для остальных namespace запрет даёт метка Pod Security Admission (baseline)."),
-    "C-0187": ("P3", "платформа",
-               "Роли со звёздочкой в правах: доступ ко всем ресурсам или ко всем действиям.",
-               "Заменить * на явный список ресурсов и действий; для ролей операторов свериться "
-               "с их документацией. Список — лист «RBAC»."),
-    "C-0185": ("P1", "платформа",
-               "Роль cluster-admin — полный доступ ко всему кластеру, включая все Secret — выдана "
-               "не только аварийной учётной записи.",
-               "Людям — вход через OIDC с ограниченными ролями; cluster-admin оставить аварийной "
-               "учётке; сервисным аккаунтам — минимальные роли. Список — лист «RBAC»."),
-    "C-0117": ("P2", "платформа",
-               "API-сервер не проверяет сертификат kubelet, когда обращается к узлу (exec, logs, "
-               "port-forward), поэтому возможен перехват.",
-               "Включить серверные сертификаты kubelet от CA кластера (в Kubespray — "
-               "kubelet_rotate_server_certificates) и задать --kubelet-certificate-authority."),
-    "C-0190": ("P2", "команды сервисов",
-               "В под монтируется токен сервисного аккаунта, хотя большинству приложений API "
-               "Kubernetes не нужен. При взломе контейнера токен достаётся атакующему.",
-               "automountServiceAccountToken: false в шаблонах; токен оставить только тем, кто "
-               "ходит в API (операторы, CI)."),
-    "C-0210": ("P2", "команды сервисов",
-               "Не задан профиль seccomp — фильтр системных вызовов контейнера. Название проверки "
-               "устарело: сейчас это RuntimeDefault, а не docker/default.",
-               "seccompProfile.type: RuntimeDefault в securityContext пода. Можно включить сразу для "
-               "всего кластера (seccompDefault в kubelet), но kubescape смотрит на манифесты и этого "
-               "не увидит. Внедрять по namespace: изредка приложения с ним падают."),
-    "C-0189": ("P3", "команды сервисов",
-               "Поды работают под сервисным аккаунтом default, поэтому у всех подов namespace "
-               "одни и те же права.",
-               "Отдельный сервисный аккаунт на приложение; у default — automountServiceAccountToken: false."),
-    "C-0209": ("инфо", "—",
-               "Ручной пункт CIS: kubescape не может сам оценить, как ресурсы поделены по namespace, "
-               "и выносит все namespace на просмотр.",
-               "Работ не требует."),
-    "C-0206": ("P2", "платформа, команды сервисов",
-               "В namespace нет сетевых политик, поэтому любой под может обратиться к любому.",
-               "Начать с запрета входящего трафика по умолчанию и явных разрешений, в первую "
-               "очередь в namespace с ПДн. Если сетевой плагин Cilium, сначала проверить политики "
-               "CiliumNetworkPolicy (kubescape их не учитывает): kubectl get cnp,ccnp -A."),
-    "C-0186": ("P2", "платформа",
-               "Субъекты, которым можно читать Secret.",
-               "Проверить по листу «RBAC»: операторам (cert-manager, external-secrets) это нужно, "
-               "людям и CI — как правило, нет."),
-    "C-0188": ("P3", "платформа",
-               "Право создавать поды: можно запустить под с любым сервисным аккаунтом namespace "
-               "и получить его права.",
-               "Оставить только CI/CD и операторам."),
-    "C-0279": ("P2", "платформа",
-               "Доступ к nodes/proxy — прямой вызов API kubelet: можно выполнять команды в подах "
-               "узла в обход журнала аудита API-сервера.",
-               "Убрать у всех, кому это не нужно для работы (например, оставить мониторингу)."),
-    "C-0281": ("P3", "платформа",
-               "Право менять admission-вебхуки: можно отключить проверки или перехватывать "
-               "создаваемые объекты.",
-               "Оставить только операторам, которые ставят свои вебхуки."),
-    "C-0282": ("P3", "платформа",
-               "Право выпускать токены сервисных аккаунтов: можно получить токен любого аккаунта namespace.",
-               "Оставить только тем, кому это нужно."),
-    "C-0278": ("P3", "платформа",
-               "Право создавать PersistentVolume: можно создать том на hostPath и добраться до файлов узла.",
-               "Оставить только CSI-драйверам и администраторам."),
-    "C-0280": ("P3", "платформа",
-               "Право одобрять запросы на сертификаты: можно выпустить клиентский сертификат на "
-               "любое имя, в том числе администратора.",
-               "Оставить только controller-manager и одобрителю сертификатов kubelet."),
-    "C-0191": ("P3", "платформа",
-               "Права bind, escalate, impersonate: позволяют выдать себе чужие права.",
-               "Оставить только администраторам кластера."),
-    "C-0207": ("P3", "команды сервисов",
-               "Приложение получает Secret через переменные окружения, а не файлом: значения видны "
-               "в /proc, дампах и иногда в логах.",
-               "Монтировать Secret файлом."),
-    "C-0113": ("P1", "платформа",
-               "API-сервер принимает запросы без аутентификации: анонимный запрос приходит от "
-               "system:anonymous.",
-               "--anonymous-auth=false. Заранее проверить, что проверки живости узлов и "
-               "внешние клиенты ходят с сертификатом или токеном."),
-    "C-0129": ("P3", "платформа",
-               "У API-сервера включён профайлер (/debug/pprof).",
-               "--profiling=false; включать только на время разбора проблем "
-               "с производительностью."),
-    "C-0130": ("P1", "платформа",
-               "Журнал аудита API-сервера не ведётся: не задан --audit-log-path.",
-               "Задать --audit-log-path и --audit-policy-file, журнал складывать в "
-               "централизованное хранилище."),
-    "C-0131": ("P3", "платформа",
-               "Срок хранения журнала аудита меньше 30 дней.",
-               "--audit-log-maxage не меньше 30; для 152-ФЗ срок согласовать с требованиями "
-               "к хранению событий безопасности."),
-    "C-0141": ("P1", "платформа",
-               "Содержимое etcd не шифруется: не задан --encryption-provider-config, значит все "
-               "Secret лежат в базе кластера в открытом виде.",
-               "Файл EncryptionConfiguration с провайдером (лучше KMS, иначе aescbc/secretbox) и "
-               "--encryption-provider-config; после включения перезаписать существующие секреты: "
-               "kubectl get secrets -A -o json | kubectl replace -f -"),
-    "C-0160": ("P1", "платформа",
-               "Нет политики аудита: не задан --audit-policy-file, поэтому события API-сервера "
-               "не отбираются и не пишутся.",
-               "Создать политику аудита (за основу — пример из документации Kubernetes), "
-               "включить её вместе с --audit-log-path."),
-    "C-0291": ("P3", "платформа",
-               "Метрики kube-proxy слушают не только localhost.",
-               "metricsBindAddress: 127.0.0.1:10249 в конфигурации kube-proxy; если метрики "
-               "собирает Prometheus, оставить доступ только ему сетевой политикой."),
-    "C-0121": ("P3", "платформа",
-               "Не включён admission-плагин EventRateLimit, ограничивающий поток событий к API-серверу.",
-               "Добавить в --enable-admission-plugins с файлом настроек."),
-    "C-0123": ("P3", "платформа",
-               "Не включён AlwaysPullImages: под может запуститься из приватного образа, уже "
-               "скачанного на узел для другого namespace.",
-               "Включить, если на узлах работают команды с разными правами на реестр. "
-               "Вырастет нагрузка на реестр."),
-    "C-0132": ("P3", "платформа",
-               "Журнал аудита API-сервера включён, но хранит меньше 10 архивов.",
-               "--audit-log-maxbackup не меньше 10 или отправка аудита в централизованное "
-               "хранилище с нужным сроком хранения."),
-    "C-0133": ("P3", "платформа",
-               "Размер файла журнала аудита меньше 100 МБ.",
-               "--audit-log-maxsize не меньше 100."),
-    "C-0134": ("P3", "платформа",
-               "Значение --request-timeout отличается от рекомендованного.",
-               "Проверить вручную: CIS допускает любое обоснованное значение."),
-    "C-0277": ("P2", "платформа",
-               "Не ограничен список шифров TLS API-сервера.",
-               "--tls-cipher-suites: только ECDHE с AES-GCM или ChaCha20. Значение из отчёта "
-               "kubescape не копировать: в нём есть RC4 и CBC."),
-    "C-0283": ("P2", "платформа",
-               "Не включён плагин DenyServiceExternalIPs: можно создать Service с чужим externalIP "
-               "и перехватить трафик (CVE-2020-8554).",
-               "Добавить DenyServiceExternalIPs в --enable-admission-plugins."),
-    "C-0290": ("P3", "платформа",
-               "API-сервер продлевает токены сервисных аккаунтов до года ради старых клиентов.",
-               "--service-account-extend-token-expiration=false; перед этим убедиться, что "
-               "приложения, работающие с API, перечитывают токен."),
-    "C-0212": ("инфо", "—",
-               "Находки в namespace default. Если это только служебный EndpointSlice kubernetes — "
-               "ложное срабатывание.",
-               "Проверить список на листе «Находки»."),
-}
-SKIPPED_NOTE = ("—", "платформа",
-                "kubescape в режиме CLI этого не проверяет: нужен доступ к файлам и настройкам на узлах.",
-                "Разово запустить kube-bench на узлах или поставить оператор kubescape.")
-FIX_OVERRIDE = {"C-0277": "задать --tls-cipher-suites без RC4 и CBC (см. лист «Проверки»)"}
-
-
-def cis_parts(name):
-    m = re.match(r"CIS-([\d.]+)\s+(.*)", name)
-    return (m.group(1), m.group(2)) if m else ("", name)
-
-
-def zone_of(ns):
-    if not ns:
-        return "кластер"
-    return "платформа" if ns in PLATFORM_NS else "сервисы"
 
 
 def check_value(col, cid):
@@ -282,41 +75,6 @@ def whose(f):
         return "платформа или оператор"
     return "приложение или CI"
 
-
-def load_names(path):
-    with open(path, encoding="utf-8-sig", newline="") as fh:
-        rows = list(csv.reader(fh, delimiter=";"))
-    return {r[0]: r[1] for r in rows[1:] if len(r) >= 2}
-
-
-def load_secret_places(path):
-    if not path.exists():
-        return []
-    with path.open(encoding="utf-8-sig", newline="") as fh:
-        rows = list(csv.reader(fh, delimiter=";"))
-    places = []
-    for kind_of_place, where in (r for r in rows[1:] if len(r) >= 2):
-        head, _, detail = where.partition(" · ")
-        kind, _, nsname = head.partition(" ")
-        ns, _, name = nsname.partition("/")
-        ns = "" if ns == "-" else ns
-        places.append((kind_of_place, ns, kind, name, detail))
-    return places
-
-
-SECRET_ACTION = {
-    ENV_MASKED: "Значение в отчёте скрыто сканером, но в манифесте оно задано строкой, а не ссылкой на "
-                "Secret. Проверить в чарте или репозитории: если там настоящий секрет — перенести в Secret "
-                "(лучше через External Secrets из Vault) и сменить.",
-    "переменные окружения": "Перенести значение в Secret (лучше через External Secrets из Vault), "
-                            "подключать через secretKeyRef или файлом; значение сменить.",
-    "аргументы запуска": "Не передавать секрет в аргументах: он виден в описании пода и в списке "
-                         "процессов. Читать из файла или из переменной из Secret; значение сменить.",
-    "пароли внутри значений": "Внутри значения есть пара «password: …» или логин с паролем в адресе. "
-                              "Проверить и вынести в Secret.",
-    "ключи ConfigMap": "ConfigMap не для секретов: перенести в Secret; значение сменить.",
-    "поля объектов": "Поле с именем как у секрета: проверить.",
-}
 
 
 class Sheet:
