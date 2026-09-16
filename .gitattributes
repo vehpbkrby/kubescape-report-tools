@@ -1,0 +1,3 @@
+# ks.sh должен оставаться с LF: с CRLF bash на Linux его не запустит
+* text=auto eol=lf
+*.sh text eol=lf
