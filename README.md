@@ -31,13 +31,34 @@ Secret, то есть пароли и токены открытым тексто
 | `ks_sanitize.py` | Выжимка `*.sanitized.json` для передачи: без значений секретов, логины заменены псевдонимами; отдельно список мест, где секреты лежат |
 | `ks_show.py` | Показать команду запуска и переменные одного ресурса — своими глазами проверить найденное место |
 
-## Установка
+## Как поставить у себя
 
-Нужен Python 3.9+ и `openpyxl` (только для таблицы xlsx):
+Нужен Python 3.9+, git и `openpyxl` (последний — только для таблицы xlsx).
 
 ```bash
+git clone https://github.com/vehpbkrby/kubescape-report-tools.git
+cd kubescape-report-tools
 pip install openpyxl
+chmod +x ks.sh
 ```
+
+Обновиться до новой версии — в той же папке:
+
+```bash
+git pull
+```
+
+Если git ставить не хочется, можно забрать архивом:
+
+```bash
+curl -L https://github.com/vehpbkrby/kubescape-report-tools/archive/refs/heads/main.tar.gz | tar xz
+cd kubescape-report-tools-main
+```
+
+Отчёты kubescape кладите в эту же папку (или в подпапку на каждый кластер) — `ks.sh`
+ищет их только рядом с собой. В репозиторий они не попадут: `.gitignore` исключает
+`*.json`, `*.xlsx`, `*.csv` и файлы разбора, чтобы `git add` случайно не выложил
+отчёт с паролями и логинами.
 
 ## Как пользоваться
 
